@@ -1,0 +1,20 @@
+### 1. 헬스 체크 (서버 켜졌나 확인 + 멤버 생성)
+GET http://localhost:8080/health
+
+### 2. 잔액 충전 (10,000원) - 위에서 만든 멤버 ID를 확인하고 고쳐주세요! (보통 1번)
+POST http://localhost:8080/api/payment/charge
+Content-Type: application/json
+
+{
+  "memberId": 1770359835189,
+  "amount": 10000
+}
+
+### 3. 잔액 사용 (5,000원)
+POST http://localhost:8080/api/payment/use
+Content-Type: application/json
+
+{
+  "memberId": 1770359835189,
+  "amount": 5000
+}
