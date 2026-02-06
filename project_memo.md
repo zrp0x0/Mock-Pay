@@ -1085,3 +1085,196 @@ public class Member {
 - Redis는 쌈: 메모리 기반이라 엄청 빠르고, 대기표를 나눠줄 수 있음
 - 전략 Redis에서 번호표를 받고 대기하다가 자기 순서가 되면 그때 DB에 들어가자
 
+---
+
+## Day 004. 분산 락으로 성능 업그레이드하기
+
+### 개념: 왜 Redis 분산 락인가?
+- 비관적 락의 한계
+    - 은행 창구(DB) 앞에 손님이 100명 줄을 서 있음
+    - 창구 직원이 일 처리하랴 줄 세우기하랴 너무 바쁨
+    - 줄 서 있는 동안 직원은 다른 손님 (단순 조회)도 못받음 (커넥션 고갈)
+
+- Redis 분산 락의 전략
+    - 은행 문 앞에 번호표 기계를 둠
+    - 동작:
+        - 손님은 Redis에서 번호표(Lock)을 뽑음
+        - 한 명만 은행 안으로 들어감
+        - 나머지는 밖에서(Redis) 대기함
+
+- 은행은 줄 세우기에 신경 안 쓰고, 들어온 한 명의 업무만 처리하면 됨
+- DB 부하가 확 줄어듦
+
+### 조금 더 엄밀히 말하면..? (이해한게 정확한가?)
+- 지금까지는 DB를 한 개만 사용했는데,
+- 여러 개의 DB를 사용할 때, DB 자체가 주는 락은 그 DB에만 해당됨
+- 여러 DB가 서로의 데이터를 물고 있을텐데
+- 한 쪽 DB만 락을 건다고 의미가 없음
+- 그래서 Redis로 완벽한(안전한) 통행증(Lock)을 받은 사람만 들어가서 작업을 할 수 있음
+- DB 부하를 줄일 수 있고, 분산 시스템에서의 안전성을 보장하는 장점이 있지만
+- 그에 따른 단점도 무조건 있음: 이건 블로그 글 봤는데 아직 내가 이해하기 조금 어려운 내용들...
+    - 그래도 하자면 Redis가 죽어버릴 수도 있고, master-slave 구조로 둔다고 해도 복제 되는 과정에서 문제가 발생할 수 있음(복제 구조가 비동기 작업)
+        - 약간 예를 들면, 키를 얻고 그 내용을 복제해야되는데 그 전에 master가 죽어버림
+        - slave가 master로 승격 => 근데 slave는 키를 얻었다는 사실을 모름
+        - 다른 사람이 키를 요구: 두 명이 하나의 키를 가지는 말도 안되는 상황 발생
+
+### 도구 챙기기
+- Lettuce와 Redisson이 있는데 락을 구현할 때는 Redisson을 많이 사용
+- 기본 라이브러리는 락 풀렸니라고 계속 물어봄(스핀 락) -> Redis가 피곤해함
+- Redisson은 락 풀리면 알려줄게라고 알람을 줌 (Pub/Sub) -> Redis가 편안해함
+
+- 의존성 추가
+    - db-core/build.gradle.kts
+    ```kotlin
+    dependencies {
+        api("org.springframework.boot:spring-boot-starter-data-jpa")
+        api("org.springframework.boot:spring-boot-starter-data-redis")
+        
+        // 👇 [추가] "Redis 락을 쉽고 강력하게 쓰게 해주는 도구"
+        api("org.redisson:redisson-spring-boot-starter:3.34.1") 
+
+        runtimeOnly("com.mysql:mysql-connector-j")
+    }
+    ```
+
+### 설정하기
+- Redisson을 스프링에 등록해야 사용할 수 있음
+- db-core/.../dbcore/config/RedissonConfig.java
+```java
+package com.zrp.mockpay.dbcore.config;
+
+import org.redisson.Redisson;
+import org.redisson.api.RedissonClient;
+import org.redisson.config.Config;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class RedissonConfig {
+
+    @Value("${spring.data.redis.host}")
+    private String redisHost;
+
+    @Value("${spring.data.redis.port}")
+    private int redisPort;
+
+    @Bean
+    public RedissonClient redissonClient() {
+        Config config = new Config();
+        // Redis 주소 연결 (redis://호스트:포트)
+        config.useSingleServer()
+              .setAddress("redis://" + redisHost + ":" + redisPort);
+        
+        return Redisson.create(config);
+    }
+}
+```
+
+### Facade 패턴 적용
+- Service에 락 코드를 넣으면 안되는 이유
+    - @Transactional과 락을 같이 걸면 타이밍 문제가 발생함
+        - 1. 락 반납
+        - 2. 트랙잭션 커밋이 안 됨 (DB 반영 중)
+        - 3. 다른 애가 락을 잡고 들어로 수 있음
+
+    - 락을 잡는 클래스(Facade)와 트랜잭션을 하는 클래스(Service)를 분리해서
+    - 락 안에서 트랜잭션이 완벽히 끝나도록 감싸줘야함
+
+### 기존 Service 원상복구
+- 비관적 락 코드 해제
+
+### PaymentFacade 만들기
+```java
+package com.zrp.mockpay.api.service;
+
+import com.zrp.mockpay.api.dto.PaymentRequest;
+import com.zrp.mockpay.api.dto.PaymentResponse;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
+import org.springframework.stereotype.Component;
+
+import java.util.concurrent.TimeUnit;
+
+@Component
+public class PaymentFacade {
+
+    private final RedissonClient redissonClient;
+    private final PaymentService paymentService;
+
+    public PaymentFacade(RedissonClient redissonClient, PaymentService paymentService) {
+        this.redissonClient = redissonClient;
+        this.paymentService = paymentService;
+    }
+
+    // 결제 진입 전, 여기서 번호표(Lock)를 뽑습니다.
+    public PaymentResponse use(PaymentRequest request) {
+        // 1. 락 이름 정의 (회원 ID 별로 잠금)
+        // 예: "payment:lock:1" -> 1번 회원 거 건드리는 사람 다 줄 서!
+        String lockKey = "payment:lock:" + request.memberId();
+        RLock lock = redissonClient.getLock(lockKey);
+
+        try {
+            // 2. 락 획득 시도 (최대 5초 기다림, 획득 후 1초 동안 잡고 있음)
+            boolean available = lock.tryLock(5, 1, TimeUnit.SECONDS);
+
+            if (!available) {
+                throw new RuntimeException("현재 사용자가 너무 많습니다. 잠시 후 다시 시도해주세요.");
+            }
+
+            // 3. 락 획득 성공! -> 진짜 비즈니스 로직(Service) 호출
+            return paymentService.use(request);
+
+        } catch (InterruptedException e) {
+            throw new RuntimeException("인터럽트 발생");
+        } finally {
+            // 4. 무조건 락 반납 (이거 안 하면 영원히 락 걸림!)
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
+        }
+    }
+}
+```
+- 내가 찾아낸 점 (AI는 내 생각이 맞다고는 하는데, 그러면 왜 처음에 저렇게 준거야..?)
+    - 저 1초 동안 락을 점유하고 해제한다고 하길래
+    - 트랜잭션 작업이 1초 안에 안 끝난다면? 어떻게 될까? -> 다른 쓰레드가 해당 락을 얻을 수 있음
+    - leasetime을 작성하면 watchdog 효과가 꺼짐
+    - watchdog
+        - 기본적으로 30초를 할당하고
+        - 작업 중이면 더 늘려줌
+
+### Controller 연결 변경
+- 이제 저 로직은 Service가 아니라 Facade를 불러야함
+- PaymentController.java
+```java
+// ...
+// PaymentService -> PaymentFacade 로 변경
+private final PaymentFacade paymentFacade;
+
+public PaymentController(PaymentFacade paymentFacade) {
+    this.paymentFacade = paymentFacade;
+}
+
+@PostMapping("/use")
+public PaymentResponse use(@RequestBody PaymentRequest request) {
+    // service.use() -> facade.use() 호출
+    return paymentFacade.use(request);
+}
+// ...
+```
+
+### 테스트
+- paymentService => paymentFacade
+```java
+@Autowired
+private PaymentFacade paymentFacade; // Service 대신 Facade
+
+// ...
+
+// paymentService.use(request); -> 아래로 변경
+paymentFacade.use(request);
+```
+- 방금 테스트하다가 그냥 찾은 건데
+- 테스트에서 중요한 건 결과가 같은지도 중요한데
+- **성공한 횟수랑 그에 맞는 결과가 나왔는지도 중요함**

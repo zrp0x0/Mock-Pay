@@ -16,4 +16,7 @@ dependencies {
 
     // Redis 도구함 추가
     api("org.springframework.boot:spring-boot-starter-data-redis")
+
+    // Redis 락을 쉽고 강력하게 쓰게 해주는 도구
+    api("org.redisson:redisson-spring-boot-starter:3.34.1")
 }

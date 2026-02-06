@@ -42,8 +42,11 @@ public class PaymentService {
 
     @org.springframework.transaction.annotation.Transactional
     public PaymentResponse use(PaymentRequest request) {
-        // 1. 손님 찾기
-        Member member = memberRepository.findByIdForUpdate(request.memberId())
+        // 1. 손님 찾기 // 비관적 락
+        // Member member = memberRepository.findByIdForUpdate(request.memberId())
+        //         .orElseThrow(() -> new IllegalArgumentException("존재하지 않는 회원입니다."));
+
+        Member member = memberRepository.findById(request.memberId())
                 .orElseThrow(() -> new IllegalArgumentException("존재하지 않는 회원입니다."));
 
         // 2. 잔액 사용 (잔액 부족하면 여기서 에러 터짐 -> 자동 롤백)
