@@ -1,0 +1,21 @@
+services:
+  # 1. 우리의 메인 데이터베이스 (장부)
+  mock-mysql:
+    image: mysql:8.0
+    container_name: mock-mysql
+    ports:
+      - "3307:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: mockpay
+    command: 
+      # 한글 깨짐 방지 설정
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+
+  # 2. 아주 빠른 임시 저장소 (포스트잇)
+  mock-redis:
+    image: redis:7.2
+    container_name: mock-redis
+    ports:
+      - "6379:6379"
