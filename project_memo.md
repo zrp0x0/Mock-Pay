@@ -878,3 +878,209 @@ Content-Type: application/json
     - PaymentService 단위 테스트
     - H2 vs Testcontainers
     - 롤백 테스트
+
+---
+
+## Day 003. 동시성 문제 해결하기
+
+### 상황 설명
+- 현재까지는 한 명만 처리했는데, 실제 처리는 매우 매우 짧은 순간에 여러 사람이 결제를 함
+- 100원 있는데 1000원이 결제될 수 있다고? (조금 난해하지만 무슨 말인지는 알겠음)
+- Thread A: 잔액 확인 (10000원) -> OK
+- Thread B: 잔액 확인 (10000원) -> OK
+- Thread A: 10000원 차감 -> 0원
+- Thread B: 10000원 차감 -> -10000원
+
+### 사고를 쳐보자 (테스트 코드로 버그 재현)
+```java
+package com.zrp.mockpay.api.service;
+
+import com.zrp.mockpay.api.dto.PaymentRequest;
+import com.zrp.mockpay.dbcore.entity.Member;
+import com.zrp.mockpay.dbcore.repository.MemberRepository;
+import com.zrp.mockpay.dbcore.repository.PaymentHistoryRepository;
+
+import com.zrp.mockpay.api.service.PaymentService;
+
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+@SpringBootTest // "스프링 서버를 실제로 띄워서 테스트할게"
+class PaymentConcurrencyTest {
+
+    @Autowired
+    private PaymentService paymentService;
+
+    @Autowired
+    private MemberRepository memberRepository;
+
+    @Autowired
+    private PaymentHistoryRepository paymentHistoryRepository;
+
+    @Test
+    @DisplayName("따닥! 100명이 동시에 1,000원씩 결제하면?")
+    void concurrency_test() throws InterruptedException {
+        paymentHistoryRepository.deleteAll();
+        memberRepository.deleteAll();
+
+        // 1. 준비: 잔액 10,000원인 멤버 생성
+        Member member = new Member("Tester", "test@concurrent.com");
+        member.charge(1000000L); // 1만원 충전
+        memberRepository.save(member);
+
+        // 2. 동시성 환경 세팅 (100명의 닌자 고용)
+        int threadCount = 150;
+        // ExecutorService: 병렬 작업을 도와주는 자바의 도구
+        ExecutorService executorService = Executors.newFixedThreadPool(32);
+        // CountDownLatch: 100명이 다 끝날 때까지 기다리게 하는 스톱워치
+        CountDownLatch latch = new CountDownLatch(threadCount);
+
+        // 3. 100명이 동시에 1,000원 결제 시도!
+        for (int i = 0; i < threadCount; i++) {
+            executorService.submit(() -> {
+                try {
+                    PaymentRequest request = new PaymentRequest(member.getId(), 1000L);
+                    paymentService.use(request); // 결제 시도!
+                } finally {
+                    latch.countDown(); // "저 다 했어요!"
+                }
+            });
+        }
+
+        // 4. 모든 요청이 끝날 때까지 대기
+        latch.await();
+
+        // 5. 검증 (결과 확인)
+        Member findMember = memberRepository.findById(member.getId()).orElseThrow();
+        
+        System.out.println("========================================");
+        System.out.println("최종 잔액: " + findMember.getBalance() + "원");
+        System.out.println("========================================");
+
+        // 기대 결과: 1,000,000원 있는데 1,000원씩 150번 썼으니...
+        // 실제 결과 850,000이 나와야함 / 근데 지금은 안나오게 하는게 테스트 성공
+        assertThat(findMember.getBalance()).isNotEqualTo(850000L);
+    }
+}
+```
+- .\gradlew :api:test --tests "com.zrp.mockpay.api.service.PaymentConcurrencyTest" --rerun-tasks -i로 실행
+- 결과:
+    - 850000원이 나와야하는데 그 이상이 나옴
+
+### 비관적 락 (Pessimistic Lock)
+- 쉽게 말하면 줄 세우기 (정확히는 줄 세우기는 아님)
+- 그니깐 현재 누군가 데이터(행)을 손대고 있으면 다른 애들은 손대지 못하도록 막는 방법
+- 데이터의 무결성을 지키기 위해 사용함
+    - 단점: 한 명이 사용하고 있으면 다른 사람은 무한 대기(시스템 전체 성능에 영향을 줌)
+
+### 트랜잭션이란과 함께 동작 원리
+- 여러 개의 DB 작업을 하나의 절대 쪼개지면 안되는 묶음으로 처리하는 규칙
+- 트랜잭션 시작
+    - Select for update
+        - 해당 row 잠김
+            - 트랜잭션 종료 시 자동 해제
+
+### 비관적 락 실제 코드 구현
+- MemberRepository 수정
+```java
+package com.zrp.mockpay.dbcore.repository;
+
+import com.zrp.mockpay.dbcore.entity.Member;
+import jakarta.persistence.LockModeType;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+import java.util.Optional;
+
+// ⚠️ interface 입니다! class 아니에요!
+public interface MemberRepository extends JpaRepository<Member, Long> {
+    // 텅 비어있어도 됩니다.
+    // JpaRepository를 상속받는 순간, save(), findById(), findAll() 같은 기능을 공짜로 얻습니다.
+
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select m from Member m where m.id = :id")
+    Optional<Member> findByIdForUpdate(@Param("id") Long id);
+}
+```
+
+- PaymentService 수정
+```java
+    @org.springframework.transaction.annotation.Transactional
+    public PaymentResponse use(PaymentRequest request) {
+        // 1. 손님 찾기
+        Member member = memberRepository.findByIdForUpdate(request.memberId())
+                .orElseThrow(() -> new IllegalArgumentException("존재하지 않는 회원입니다."));
+```
+- 여기서 저 member에 대한 DB(행)에 자물쇠가 걸림
+- 근데 인덱스 설정 이런걸 해줘야 명확히 자물쇠가 걸린다는 이야기가 있던데
+
+### 주의할 점
+- 락은 트랜잭션(@Transactional)이 시작될 때 유효하고, 끝날 때 자동으로 풀림
+- 데드락 위험
+    - 서로 다른 두 트랜잭션이 서로의 자물쇠가 풀리기만을 하염없이 기다리는 상황이 올 수 있습니다.
+    - 예: A는 1번 락을 잡고, 2번을 기다림 / B는 2번 락을 잡고 1번을 기다림 - 무한 대기
+    - 해결책: 락을 잡는 순서를 항상 일정하게 맞춰야함
+
+- 성능 이슈가 있음
+    - 조회용으로는 절대 사용 X
+    - 조회는 어차피 데이터를 건드리지 않으므로
+
+### 근데 인덱스 설정 이런걸 해줘야 명확히 자물쇠가 걸린다는 이야기가 있던데 (추가 내용 - 정확하진 않음)
+- MySQL(InnoDB)은 데이터가 아니라 인덱스에 자물쇠를 검
+    - 실제 데이터 행을 잠그는게 아니라, 그 행을 찾기 위해 거쳐간 **인덱스**를 잠금
+    
+- 실제로 위험한 상황
+    - id가 아닌 name으로 락을 걸면
+    - name에 현재는 인덱스를 만들어 놓지 않았기 때문에
+    - 모든 행에 자물쇠를 다 채워버림 (찾아봐야하기 때문에)
+        - 그니깐 엄밀하게는 테이블 자체에 락을 건다는 건 아님
+
+- 근데 지금은 ID를 사용해서 데이터를 조회하고 있음
+
+### 낙관적 락
+- 낙관적 락은 버전이라는 개념을 추가해서 수정되기 전 버전을 기억해두었다가 수정을 하는 시점에 그 버전이 기억해둔 버전과 일치하지 않으면 예외(혹은 재시도 로직) 일치하면 업데이트하면서 버전 + 1을 하는 동작
+- 근데 비관적 락은 기다렸다가 하는 반면, 낙관적 락은 재시도 로직이 없으면 예외가 발생함
+- 추천
+    - 충돌이 잦으면 비관적 락: 결제, 수강신청, 티켓팅
+    - 충돌이 거의 없으면 낙관적 락: 게시글 수정, 내 정보 수정(락 거는 비용을 아낄 수 있음 / 가끔 충돌 나면 다시해주세요 하면 됨)
+
+- 구현 예시: 엔티티에 @Version을 붙이면 됨
+```java
+// Member.java
+
+@Entity
+public class Member {
+    // ... 기존 필드 ...
+
+    @Version // 👇 이것만 붙이면 낙관적 락 작동!
+    private Long version; 
+}
+```
+- 낙관적 락도 트랜잭션 안에 있어야함
+
+- 그리고 결제에서는 왠만해서 사용하지 말자
+    - 충돌 시 실패 -> 재시도
+    - 재시도 동안 같은 금액을 다시 계산
+    - 고부하 상황에서 계속 실패할 가능성이 높음
+
+### 비관적 락 오해
+- 줄서기가 아님
+- 눈치싸움임
+- 그래서 문제가 발생할 수 있는데
+    - 무한 대기 상태에 빠지면 커넥션 풀을 다 먹어버릴 수 있음
+    - SET innodb_lock_wait_timeout = 3;으로 DB의 락 대기 시간을 줄여야함
+
+### 왜 Redis로 가야하는가?
+- DB는 비쌈: 커넥션 하나하나가 귀한 자원임 (순서 기다리기 따위에 쓰기엔 너무 아까움)
+- Redis는 쌈: 메모리 기반이라 엄청 빠르고, 대기표를 나눠줄 수 있음
+- 전략 Redis에서 번호표를 받고 대기하다가 자기 순서가 되면 그때 DB에 들어가자
