@@ -71,7 +71,7 @@ public class PaymentFacade {
     // key: #request.memberId -> 파라미터 'request'의 'memberId' 필드를 키로 쓴다.
     // waitTime: 100초 (테스트용으로 길게 잡음)
     @DistributedLock(key = "#request.memberId", waitTime = 100, timeUnit = TimeUnit.SECONDS)
-    public PaymentResponse use(PaymentRequest request) throws Exception {
+    public PaymentResponse use(PaymentRequest request) {
         return paymentService.use(request);
     }
 }

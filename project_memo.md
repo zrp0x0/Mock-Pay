@@ -1806,3 +1806,96 @@ public void use(PaymentRequest request) throws Exception { ... }
 
 ## Day 007. 트랜잭션 쪼개기 (Propagation)
 
+### 새로운 시나리오?(근데 이거 좀 웃기네 - 일단 하란데로 해보자 ㅋㅋㅋ)
+- 메인 기능 (핵심)
+    - 사용자가 결제를 하면 잔액을 차감하고 결제 이력을 남김
+    - 절대 실패하면 안됨
+
+- 서브 기능(보너스)
+    - 결제가 끝나면 1% 포인트를 적립해줌
+
+- 문제 상황
+    - 포인트 서버에 불이나서 적립 기능이 고장남
+    - 결제까지 막아버려야하는가?
+        - 일단 결제는 성공 시키고, 포인트 적립만 실패 처리(또는 나중에 재시도 하는 방향으로)
+        - 왜냐하면 결제에 대한 기록은 가지고 있으니깐!!
+
+### 트랜잭션 전파 (Propagation)
+- 스프링에서 @Transactional은 기본적으로 우리는 한 배를 탔다는 정책을 사용함
+    - 기본(REQUIRED): 부모(결제)가 자식(적립)을 부르면 자식은 부모의 트랜잭션에 합류함
+        - 자식이 에러를 내면 부모도 같이 롤백함
+
+    - 분리(REQUIRES_NEW): 자식이 저는 따로 갈게요라고 선언함
+        - 자식이 에러가 나서 침몰해도 부모(결제)는 영향받지 않고 성공(커밋)함
+
+### PointService 만들기
+```java
+package com.zrp.mockpay.api.service;
+
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class PointService {
+
+    // 여기가 핵심! "나는 부모와 상관없이 새 트랜잭션을 만든다"
+    // REQUIRES_NEW: 이미 트랜잭션이 있어도, 무시하고 새로 만듦.
+    @Transactional(propagation = org.springframework.transaction.annotation.Propagation.REQUIRES_NEW)
+    public void earnPoints(Long memberId, Long amount) {
+        // 포인트 적립 로직이 들어갈 자리...
+        
+        // 하지만 테스트를 위해 강제로 폭탄을 터뜨립니다!
+        throw new RuntimeException("⚠ 포인트 서버 접속 불가! (적립 실패)");
+    }
+    
+}
+```
+
+### 방화벽 설치 (그 방화벽 아님)
+- REQUIRES_NEW를 썻다고 끝이 아님
+- 자식 트랜잭션에서 에러가 발생하면 그 에러는 부모의 트랜잭션에서도 에러로 전파됨
+- 따라서 메인 서비스에서 예외를 잡아줘야함
+```java
+try {
+    pointService.earnPoints(member.getId(), request.amount());
+} catch (Exception e) {
+    System.out.println("⚠ 포인트 적립 실패! (하지만 결제는 진행함): " + e.getMessage());
+}
+```
+- 추가로 pointService 의존성 주입도 해줘야함
+
+### 테스트 코드
+```java
+@Test
+@DisplayName("포인트 적립이 실패해도(서브 트랜잭션 롤백), 잔액 차감(메인 트랜잭션)은 성공해야 한다.")
+void partial_success_test() {
+    // 1. 준비
+    Member member = new Member("PartialTester", "partial@test.com");
+    member.charge(10000L); // 1만원 충전
+    memberRepository.save(member);
+
+    PaymentRequest request = new PaymentRequest(member.getId(), 2000L);
+
+    // 2. 실행
+    // (내부에서 PointService가 에러를 뿜지만, try-catch로 삼켜서 무시함)
+    paymentService.use(request);
+
+    // 3. 검증
+    Member findMember = memberRepository.findById(member.getId()).orElseThrow();
+    
+    System.out.println("========================================");
+    System.out.println("기대 잔액: 8000원 (결제 성공)");
+    System.out.println("실제 잔액: " + findMember.getBalance() + "원");
+    System.out.println("========================================");
+
+    // 여기가 통과하면, 당신은 '트랜잭션 분리'를 마스터한 것입니다!
+    assertThat(findMember.getBalance()).isEqualTo(8000L);
+}
+```
+- 실행
+    - .\gradlew :api:test --tests "com.zrp.mockpay.api.service.PaymentTransactionTest" --rerun-tasks -i
+
+### 중간 정리
+- REQUIRED: 부모+자식이 한 배를 탐
+- REQUIRES_NEW: 자식은 따로 구명보트를 타고 감 - 자식이 실패해도 부모는 갈길을 감
+    - try-catch: 대신 부모에게 그 실패가 영향을 주지 않도록 처리를 해야함

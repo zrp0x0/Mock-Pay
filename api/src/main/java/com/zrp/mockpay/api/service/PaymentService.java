@@ -2,6 +2,7 @@ package com.zrp.mockpay.api.service;
 
 import com.zrp.mockpay.api.dto.PaymentRequest;
 import com.zrp.mockpay.api.dto.PaymentResponse;
+import com.zrp.mockpay.api.service.PointService;
 import com.zrp.mockpay.dbcore.entity.Member;
 import com.zrp.mockpay.dbcore.entity.PaymentHistory;
 import com.zrp.mockpay.dbcore.enums.PaymentType;
@@ -15,10 +16,12 @@ public class PaymentService {
 
     private final MemberRepository memberRepository;
     private final PaymentHistoryRepository paymentHistoryRepository;
+    private final PointService pointService;    
 
-    public PaymentService(MemberRepository memberRepository, PaymentHistoryRepository paymentHistoryRepository) {
+    public PaymentService(MemberRepository memberRepository, PaymentHistoryRepository paymentHistoryRepository, PointService pointService) {
         this.memberRepository = memberRepository;
         this.paymentHistoryRepository = paymentHistoryRepository;
+        this.pointService = pointService;
     }
 
     // 👇 [중요] Transactional: 이 메서드가 끝날 때까지 에러가 없어야 DB에 반영됨!
@@ -41,7 +44,7 @@ public class PaymentService {
     }
 
     @org.springframework.transaction.annotation.Transactional(rollbackFor = Exception.class)
-    public PaymentResponse use(PaymentRequest request) throws Exception {
+    public PaymentResponse use(PaymentRequest request) {
         // 1. 손님 찾기 // 비관적 락
         // Member member = memberRepository.findByIdForUpdate(request.memberId())
         //         .orElseThrow(() -> new IllegalArgumentException("존재하지 않는 회원입니다."));
@@ -64,8 +67,15 @@ public class PaymentService {
         // }
 
         // Checked Error 테스트
-        if (true) {
-            throw new Exception("체크드 예외 발생! 롤백이 안 될걸?");
+        // if (true) {
+        //     throw new Exception("체크드 예외 발생! 롤백이 안 될걸?");
+        // }
+
+        // 트랜잭션 전파 공부
+        try {
+            pointService.earnPoints(member.getId(), request.amount());
+        } catch (Exception e) {
+            System.out.println("⚠ 포인트 적립 실패! (하지만 결제는 진행함): " + e.getMessage());
         }
 
         // 4. 결과 리턴
