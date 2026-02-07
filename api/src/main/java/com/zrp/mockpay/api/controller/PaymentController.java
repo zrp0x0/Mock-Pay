@@ -29,7 +29,7 @@ public class PaymentController {
 
     // 결제 API: POST /api/payment/use
     @PostMapping("/use")
-    public PaymentResponse use(@RequestBody PaymentRequest request) {
+    public PaymentResponse use(@RequestBody PaymentRequest request) throws Exception {
         // return paymentService.use(request);
         return paymentFacade.use(request);
     }

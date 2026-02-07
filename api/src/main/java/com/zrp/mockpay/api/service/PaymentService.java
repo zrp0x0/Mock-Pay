@@ -40,12 +40,13 @@ public class PaymentService {
         return new PaymentResponse("충전 성공", member.getBalance());
     }
 
-    @org.springframework.transaction.annotation.Transactional
-    public PaymentResponse use(PaymentRequest request) {
+    @org.springframework.transaction.annotation.Transactional(rollbackFor = Exception.class)
+    public PaymentResponse use(PaymentRequest request) throws Exception {
         // 1. 손님 찾기 // 비관적 락
         // Member member = memberRepository.findByIdForUpdate(request.memberId())
         //         .orElseThrow(() -> new IllegalArgumentException("존재하지 않는 회원입니다."));
 
+        // 분산 락 사용 중
         Member member = memberRepository.findById(request.memberId())
                 .orElseThrow(() -> new IllegalArgumentException("존재하지 않는 회원입니다."));
 
@@ -55,6 +56,17 @@ public class PaymentService {
         // 3. 영수증 기록
         PaymentHistory history = new PaymentHistory(member, request.amount(), PaymentType.USE);
         paymentHistoryRepository.save(history);
+
+        // 테스트용 지뢰 강제로 예외 발생
+        // 상황: DB에 저장은 다 했는데 마지막에 알 수 없는 에러가 터짐
+        // if (true) {
+        //     throw new RuntimeException("⚠ 긴급! 결제 마무리 중 에러 발생!");
+        // }
+
+        // Checked Error 테스트
+        if (true) {
+            throw new Exception("체크드 예외 발생! 롤백이 안 될걸?");
+        }
 
         // 4. 결과 리턴
         return new PaymentResponse("결제 성공", member.getBalance());

@@ -1592,3 +1592,217 @@ public class PaymentFacade {
 
 ### 추가로 공부한 내용
 - 여러 AOP가 (어노테이션이라고 생각하자) 붙으면 실행 순서는 명시하지 않는 한 보장되지 않음
+
+---
+
+## Day 006. 결제는 됐는데 장부가 없어? (트랜잭션의 엄밀함)
+
+### 개념: ACID와 원자성(Atomicity)
+- 우리가 만드는 결제 로직은 두 가지 행동의 합임
+    - 1. Member Update: 사용자 잔액 차감
+    - 2. History Insert: 결제 내역 기록
+
+- 이 두 가지는 **All or Nothing**이어야함
+    - 둘 다 성공하거나
+    - 하라라도 실패하면 둘 다 없던 일로 돌려야함 (Rollback)
+
+- 만약 1번은 성공했는데 2번에서 에러가 나면? -> 돈은 나갔는데 결제 내역이 없는 끔찍한 상황(데이터 불일치)이 발생함
+
+### 1단계: 재앙 지뮬레이션 (강제로 에러 내기)
+```java
+@org.springframework.transaction.annotation.Transactional
+public PaymentResponse use(PaymentRequest request) {
+    // 1. 손님 찾기 // 비관적 락
+    // Member member = memberRepository.findByIdForUpdate(request.memberId())
+    //         .orElseThrow(() -> new IllegalArgumentException("존재하지 않는 회원입니다."));
+
+    // 분산 락 사용 중
+    Member member = memberRepository.findById(request.memberId())
+            .orElseThrow(() -> new IllegalArgumentException("존재하지 않는 회원입니다."));
+
+    // 2. 잔액 사용 (잔액 부족하면 여기서 에러 터짐 -> 자동 롤백)
+    member.use(request.amount());
+
+    // 3. 영수증 기록
+    PaymentHistory history = new PaymentHistory(member, request.amount(), PaymentType.USE);
+    paymentHistoryRepository.save(history);
+
+    // 테스트용 지뢰 강제로 예외 발생
+    // 상황: DB에 저장은 다 했는데 마지막에 알 수 없는 에러가 터짐
+    if (true) {
+        throw new RuntimeException("결제 마무리 중 에러 발생!!!");
+    }
+
+    // 4. 결과 리턴
+    return new PaymentResponse("결제 성공", member.getBalance());
+}
+```
+
+### 2단계: 테스트 코드로 검증
+```java
+package com.zrp.mockpay.api.service;
+
+import com.zrp.mockpay.api.dto.PaymentRequest;
+import com.zrp.mockpay.dbcore.entity.Member;
+import com.zrp.mockpay.dbcore.repository.MemberRepository;
+import com.zrp.mockpay.dbcore.repository.PaymentHistoryRepository;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+@SpringBootTest
+class PaymentTransactionTest {
+
+    @Autowired
+    private PaymentService paymentService; // 여기선 Facade 말고 Service를 직접 테스트해도 됩니다.
+
+    @Autowired
+    private MemberRepository memberRepository;
+
+    @Autowired
+    private PaymentHistoryRepository paymentHistoryRepository;
+
+    @Test
+    @DisplayName("결제 중 예외가 발생하면, 차감된 잔액은 롤백되어야 한다.")
+    void rollback_test() {
+        paymentHistoryRepository.deleteAll();
+        memberRepository.deleteAll();
+        
+
+        // 1. 준비
+        Member member = new Member("RollbackTester", "rollback@test.com");
+        member.charge(10000L); // 1만원 충전
+        memberRepository.save(member);
+
+        PaymentRequest request = new PaymentRequest(member.getId(), 2000L);
+
+        // 2. 실행 (예외가 터져야 정상)
+        assertThatThrownBy(() -> paymentService.use(request))
+                .isInstanceOf(RuntimeException.class)
+                .hasMessage("⚠ 긴급! 결제 마무리 중 에러 발생!");
+
+        // 3. 검증 (가장 중요!)
+        // 에러가 나서 튕겨 나갔으니, 잔액은 깎이지 않고 10,000원 그대로여야 함.
+        Member findMember = memberRepository.findById(member.getId()).orElseThrow();
+        
+        System.out.println("========================================");
+        System.out.println("기대 잔액: 10000원");
+        System.out.println("실제 잔액: " + findMember.getBalance() + "원");
+        System.out.println("========================================");
+
+        assertThat(findMember.getBalance()).isEqualTo(10000L);
+    }
+}
+```
+- 실행
+    - .\gradlew :api:test --tests "com.zrp.mockpay.api.service.PaymentTransactionTest" --rerun-tasks -i
+
+### Checked Exception의 함정
+- 위에 테스트가 성공해서 롤백이 잘되었음
+- 자바의 예외에는 두 가지 종류가 있음
+    - Unchecked Exception: RuntimeException 상속: 실행 중에 발생 / 스프링이 자동으로 롤백함
+    - Checked Exception: Exception 상속: 컴파일러가 처리를 강제함.
+        - **스프링은 이걸 롤백하지 않음 (Commit 해버림)**
+
+### 실험 테스트 코드
+```java
+package com.zrp.mockpay.api.service;
+
+import com.zrp.mockpay.api.dto.PaymentRequest;
+import com.zrp.mockpay.dbcore.entity.Member;
+import com.zrp.mockpay.dbcore.repository.MemberRepository;
+import com.zrp.mockpay.dbcore.repository.PaymentHistoryRepository;
+
+import com.zrp.mockpay.api.service.PaymentService;
+
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+@SpringBootTest
+class PaymentTransactionTest {
+
+    @Autowired
+    private PaymentService paymentService; // 여기선 Facade 말고 Service를 직접 테스트해도 됩니다.
+
+    @Autowired
+    private MemberRepository memberRepository;
+
+    @Autowired
+    private PaymentHistoryRepository paymentHistoryRepository;
+
+    @Test
+    @DisplayName("결제 중 예외가 발생하면, 차감된 잔액은 롤백되어야 한다.")
+    void rollback_test() throws Exception {
+        paymentHistoryRepository.deleteAll();
+        memberRepository.deleteAll();
+        
+
+        // 1. 준비
+        Member member = new Member("RollbackTester", "rollback@test.com");
+        member.charge(10000L); // 1만원 충전
+        memberRepository.save(member);
+
+        PaymentRequest request = new PaymentRequest(member.getId(), 2000L);
+
+        // 2. 실행 (예외가 터져야 정상)
+        // assertThatThrownBy(() -> paymentService.use(request))
+        //         .isInstanceOf(RuntimeException.class)
+        //         .hasMessage("⚠ 긴급! 결제 마무리 중 에러 발생!");
+
+        assertThatThrownBy(() -> paymentService.use(request))
+                .isInstanceOf(Exception.class)
+                .hasMessage("체크드 예외 발생! 롤백이 안 될걸?");
+
+        // 3. 검증 (가장 중요!)
+        // 에러가 나서 튕겨 나갔으니, 잔액은 깎이지 않고 10,000원 그대로여야 함.
+        Member findMember = memberRepository.findById(member.getId()).orElseThrow();
+        
+        System.out.println("========================================");
+        System.out.println("기대 잔액: 10000원");
+        System.out.println("실제 잔액: " + findMember.getBalance() + "원");
+        System.out.println("========================================");
+
+        assertThat(findMember.getBalance()).isNotEqualTo(10000L);
+    }
+}
+```
+- 그 외 디테일들이 Checked Exception은 예외를 던져주거나 try - catch로 잡아줘야함 - 까다롭게 구네.. 빌드 실패 여러 번 함 ㅋㅋㅋ
+
+### 왜 롤백이 안될까? (Checked Exception)
+- RuntimeException
+    - 개발자의 실수거나 시스템 장애일 것이다!!
+    - 무조건 롤백해!!
+
+- Exception
+    - 비즈니스적으로 예견된 상황일 수도 있다. 무조건 롤백해서는 안된다
+    - 개발자가 이건 알아서 처리해줄거야
+    - 결과: 자동 커밋 => 돈이 깍인 채로 저장됨
+
+### 그러면 Checked Exception은 롤백을 할 수 없는 것인가?
+- @Transactional에 옵션을 추가하면됨
+```java
+// PaymentService.java
+
+// 기존 코드
+@Transactional
+public void use(PaymentRequest request) throws Exception { ... }
+
+// 수정 코드 (옵션 추가!)
+// "Exception 클래스(체크드 예외)가 터져도 무조건 롤백해줘!"라는 뜻입니다.
+@Transactional(rollbackFor = Exception.class) 
+public void use(PaymentRequest request) throws Exception { ... }
+```
+
+--
+
+## Day 007. 트랜잭션 쪼개기 (Propagation)
+
