@@ -13,7 +13,8 @@ public class PointService {
         // 포인트 적립 로직이 들어갈 자리...
         
         // 하지만 테스트를 위해 강제로 폭탄을 터뜨립니다!
-        throw new RuntimeException("⚠ 포인트 서버 접속 불가! (적립 실패)");
+        // throw new RuntimeException("⚠ 포인트 서버 접속 불가! (적립 실패)");
+        System.out.println("포인트 서버 적립 성공");
     }
     
 }

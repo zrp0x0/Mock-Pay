@@ -1899,3 +1899,170 @@ void partial_success_test() {
 - REQUIRED: 부모+자식이 한 배를 탐
 - REQUIRES_NEW: 자식은 따로 구명보트를 타고 감 - 자식이 실패해도 부모는 갈길을 감
     - try-catch: 대신 부모에게 그 실패가 영향을 주지 않도록 처리를 해야함
+
+
+---
+
+## Day 008. Phase 2. 멱등성
+
+### 개념: 멱등성(Idempotency)이란?
+- 식당 주문 예시:
+    - 상황: 손님이 키오스크에서 햄버거 하나요라고 결제 버튼을 누름
+    - 문제: 키오스크가 렉이 걸려서 반응이 없자, 손님 짜증나서 버튼을 따닥(두 번 )누름
+    - 멱등성이 없다면?
+        - 주문이 2개가 들어감 -> 돈 2배 (대참사)
+    - 멱등성이 있다면: 키오스크가 아까 그 주문번호네? 이미 주문이 들어갔으니깐 무시해!!라고 처리할 수 있음
+
+- 핵심: 1번 요청하나 100번 요청하나 결과는 똑같아야함 (잔액은 한 번만 차감되어야함)
+
+### 설계: Redis를 활용한 "영수증 검사기"
+- 요청이 들어올 때 "고유한 주문 번호(orderId)를 달고 옴
+- PaymentFacade가 젤 먼저 Redis한테 물어봄
+    - 이 orederId 처리한 적있어?
+- Case A: 처음 본 주문이다
+    - 정상적으로 락 걸고 -> 결제 진행 -> 결과를 Redis에 저장 -> 응답 반환
+- Case B: 아까 본 주문이다
+    - DB까지 안 가고 Redis에 저장해둔 결과를 바로 던져줌
+
+### 미션: 코드 수정
+- PaymentRequest.java에 orderId를 추가해야함
+```java
+package com.zrp.mockpay.api.dto;
+
+// record: "데이터만 담는 그릇"을 만드는 최신 문법 (Getter, 생성자 자동 생성)
+public record PaymentRequest(
+    String orderId, // 결제의 고유 번호
+    Long memberId,
+    Long amount
+) {}
+```
+
+- Facade에 멱등성 로직 추가
+```java
+private final StringRedisTemplate redisTemplate; // Redis 도구 추가
+private final ObjectMapper objectMapper; // 객체 -> JSON 변환기
+
+// 멱등성
+@DistributedLock(key = "#request.memberId", waitTime = 100, timeUnit = TimeUnit.SECONDS)
+public PaymentResponse use(PaymentRequest request) {
+    
+    // 1. 멱등성 검증: "이미 처리된 주문번호인가?"
+    String idempotencyKey = "pay:history:" + request.orderId();
+    
+    try {
+        // Redis에서 조회
+        String savedResponse = redisTemplate.opsForValue().get(idempotencyKey);
+        
+        if (savedResponse != null) {
+            // ✌️ "어! 이거 아까 처리했어요. 여기 영수증(결과) 가져가세요."
+            System.out.println("♻️ 중복 요청 감지! 저장된 응답 반환: " + request.orderId());
+            return objectMapper.readValue(savedResponse, PaymentResponse.class);
+        }
+
+        // 2. 비즈니스 로직 실행 (실제 결제)
+        PaymentResponse response = paymentService.use(request);
+
+        // 3. 결과 저장 (Redis에 "처리 완료" 도장 찍기)
+        // 24시간 동안 보관 (실무에선 정책에 따라 다름)
+        String responseJson = objectMapper.writeValueAsString(response);
+        redisTemplate.opsForValue().set(idempotencyKey, responseJson, 24, TimeUnit.HOURS);
+
+        return response;
+
+    } catch (Exception e) {
+        // JSON 변환 에러 등은 런타임 에러로 던짐
+        throw new RuntimeException(e);
+    }
+}
+```
+- 그리고 하다가 발생한건데, 충전 요청을 분리함
+- ChargeRequest -> 기존 PaymentReqeust
+- PaymentRequest -> OrderId추가
+
+### 이런건 언제 해주어하는 걸까?
+- 결제 페이지를 들어갈 때 결제 고유 번호를 부여하고 그 번호로 요청을 보내도록해야함!!
+- 그리고 그 결제 요청 고유 번호를 Redis에 넣어놓고, DB에서 검사하기 전에 Redis에 해당 ID가 있는지 검사 후 진행
+
+---
+
+## Day 009. 대용량 트래픽과 비동기 처리
+
+### 결제는 끝났어 나머지는 알아서 해!!
+- 왜 Kafka를 써야할까?
+    - 지금까지는 모든 일을 다 처리하는 주방장이었음
+    - 손님이 결제함 -> 장부 기록 + 포인트 적립 + 이메일 발송 + 카톡 알림 보내기 -> 결제 끝
+    - 문제점
+        - 느림: 이메일 서버가 느리면 손님은 결제 완료 화면을 늦게 봄
+        - 위험: 카톡 서버가 죽으면, 켤제까지 다 취소해야하나요? (아니지!!)
+
+- Kafka를 도입하면
+    - 개선: 손님이 결제함 (장부 기록하고 주문 1건 완료) -> 결제 끝
+    - 뒷단: 설거지 담당(Consumer A)이 소리를 듣고 포인트를 적립함 / 홍보 담당(Consumer B)이 소리를 듣고 카톡을 보냄
+    - 장점: 주방장은 요리(결제)에만 집중할 수 있음
+
+### Docker에 Kafka 설치하기
+```yml
+services:
+  # 1. MySQL (기존)
+  mock-mysql:
+    image: mysql:8.0
+    container_name: mock-mysql
+    ports:
+      - "3307:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: mockpay
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+
+  # 2. Redis (기존)
+  mock-redis:
+    image: redis:7.2
+    container_name: mock-redis
+    ports:
+      - "6379:6379"
+
+  # 👇 [추가] 3. Zookeeper (Kafka 관리자)
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: mock-zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  # 👇 [추가] 4. Kafka (메시지 큐)
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: mock-kafka
+    ports:
+      - "9092:9092"
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+```
+- docker-compose down
+- docker-compose up -d
+
+### 의존성 설정
+- api/build.gradle.kts 수정
+```kotlin
+dependencies {
+    implementation("org.springframework.boot:spring-boot-starter-web")
+    implementation(project(":db-core"))
+
+    // 👇 [추가] Kafka를 쓰기 위한 필수 라이브러리
+    implementation("org.springframework.kafka:spring-kafka")
+}
+```
+
+### 

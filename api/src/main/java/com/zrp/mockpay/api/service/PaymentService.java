@@ -9,6 +9,8 @@ import com.zrp.mockpay.dbcore.enums.PaymentType;
 import com.zrp.mockpay.dbcore.repository.MemberRepository;
 import com.zrp.mockpay.dbcore.repository.PaymentHistoryRepository;
 import jakarta.transaction.Transactional; // ⚠️ org.springframework... 가 아니라 jakarta... 를 써도 되지만, 보통 스프링에선 org.springframework.transaction.annotation.Transactional을 씁니다. (아래 설명 참조)
+import com.zrp.mockpay.api.dto.ChargeRequest;
+
 import org.springframework.stereotype.Service;
 
 @Service // "나는 비즈니스 로직을 담당하는 직원(Service)이야"
@@ -27,7 +29,7 @@ public class PaymentService {
     // 👇 [중요] Transactional: 이 메서드가 끝날 때까지 에러가 없어야 DB에 반영됨!
     // 하나라도 실패하면 없던 일로 되돌림 (Rollback)
     @org.springframework.transaction.annotation.Transactional
-    public PaymentResponse charge(PaymentRequest request) {
+    public PaymentResponse charge(ChargeRequest request) {
         // 1. 손님 찾기 (없으면 에러)
         Member member = memberRepository.findById(request.memberId())
                 .orElseThrow(() -> new IllegalArgumentException("존재하지 않는 회원입니다."));

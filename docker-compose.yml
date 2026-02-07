@@ -1,5 +1,5 @@
 services:
-  # 1. 우리의 메인 데이터베이스 (장부)
+  # 1. MySQL (기존)
   mock-mysql:
     image: mysql:8.0
     container_name: mock-mysql
@@ -8,14 +8,40 @@ services:
     environment:
       MYSQL_ROOT_PASSWORD: root
       MYSQL_DATABASE: mockpay
-    command: 
-      # 한글 깨짐 방지 설정
+    command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
 
-  # 2. 아주 빠른 임시 저장소 (포스트잇)
+  # 2. Redis (기존)
   mock-redis:
     image: redis:7.2
     container_name: mock-redis
     ports:
       - "6379:6379"
+
+  # 👇 [추가] 3. Zookeeper (Kafka 관리자)
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: mock-zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  # 👇 [추가] 4. Kafka (메시지 큐)
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: mock-kafka
+    ports:
+      - "9092:9092"
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1

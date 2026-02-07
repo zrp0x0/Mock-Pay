@@ -1,5 +1,6 @@
 package com.zrp.mockpay.api.controller;
 
+import com.zrp.mockpay.api.dto.ChargeRequest;
 import com.zrp.mockpay.api.dto.PaymentRequest;
 import com.zrp.mockpay.api.dto.PaymentResponse;
 import com.zrp.mockpay.api.service.PaymentFacade;
@@ -23,7 +24,7 @@ public class PaymentController {
 
     // 충전 API: POST /api/payment/charge
     @PostMapping("/charge")
-    public PaymentResponse charge(@RequestBody PaymentRequest request) {
+    public PaymentResponse charge(@RequestBody ChargeRequest request) {
         return paymentService.charge(request);
     }
 

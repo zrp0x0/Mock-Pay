@@ -18,3 +18,41 @@ Content-Type: application/json
   "memberId": 1770359835189,
   "amount": 5000
 }
+
+// 중복 결제 템플릿
+### 0. (필수) 헬스 체크 & 멤버 생성 (콘솔에서 memberId 확인 필요!)
+GET http://localhost:8080/health
+
+### 1. 첫 번째 결제 요청 (정상 승인)
+# orderId를 주목하세요! "ORDER-001" 입니다.
+POST http://localhost:8080/api/payment/use
+Content-Type: application/json
+
+{
+  "orderId": "ORDER-001",
+  "memberId": 1, 
+  "amount": 1000
+}
+
+### 2. (따닥!) 중복 결제 요청 
+# orderId가 위와 똑같은 "ORDER-001" 입니다.
+# 기대 결과: 잔액은 줄어들지 않고, 위와 똑같은 응답(성공 메시지)이 와야 합니다.
+POST http://localhost:8080/api/payment/use
+Content-Type: application/json
+
+{
+  "orderId": "ORDER-001",
+  "memberId": 1,
+  "amount": 1000
+}
+
+### 3. 새로운 결제 요청 (정상 승인)
+# orderId가 "ORDER-002"로 바뀌었습니다. 이건 결제가 되어야 합니다.
+POST http://localhost:8080/api/payment/use
+Content-Type: application/json
+
+{
+  "orderId": "ORDER-002",
+  "memberId": 1,
+  "amount": 1000
+}
