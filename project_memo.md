@@ -1275,6 +1275,292 @@ private PaymentFacade paymentFacade; // Service 대신 Facade
 // paymentService.use(request); -> 아래로 변경
 paymentFacade.use(request);
 ```
-- 방금 테스트하다가 그냥 찾은 건데
+- 방금 테스트하다가 그냥 알게된 건데
 - 테스트에서 중요한 건 결과가 같은지도 중요한데
 - **성공한 횟수랑 그에 맞는 결과가 나왔는지도 중요함**
+
+---
+
+## Day 005. AOP와 분산 락의 구조
+
+### 횡단 관심사 (Cross-Cutting Concerns)
+- 핵심 관심사(Core Concern): 결제, 이체, 회원가입 등 비즈니스 로직
+- 횡단 관심사: 로깅, 보안, 트랜잭션, 락처럼 모든 비즈니스 로직에 공통적으로 걸쳐있는 기능
+- PaymentFacade에 있던 락이라는 횡단 관심사를 떼어내어 Aspect라는 별도의 모듈로 분리할 것
+
+### 스프링 AOP의 동작 원리(Dynamic Proxy)
+- 스프링은 AOP를 적용하기 위해 프록시(대리자) 패턴을 사용함
+- 초기화 시점
+    - 스프링이 서버를 띄울 때, @DistributedLock이 붙은 빈을 발견하면, 진짜 객체 PaymentFacade 대신 가짜 객체(Proxy)를 먼저 생성함
+
+- 실행 시점
+    - Controller가 facade.use()를 호출하면, Proxy의 use()가 호출됨
+    - Proxy: 어 이거 락 걸어야하네? -> Aspect 실행 (Redis 락 획득)
+    - Proxy: 이제 진짜 객체 실행해 -> Target (PaymentFacade)실행
+    - Proxy: 끝났네? 락 풀어 -> Aspect 실행 (Redis 락 해제)
+
+### 구현 1단계: 어노테이션 정의(@DistributedLock)
+- Annotation은 그 자체로는 아무 기능이 없는 메타데이터(표식)임
+- 이걸 나중에 AOP가 보고 동작함
+```java
+package com.zrp.mockpay.dbcore.aop;
+
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Redisson Distributed Lock Annotation
+ * <p>
+ * 실무 Tip: RetentionPolicy.RUNTIME이어야 JVM 실행 시점에 리플렉션으로 정보를 읽을 수 있습니다.
+ * Target은 메서드 레벨에만 붙이도록 제한합니다.
+ */
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface DistributedLock {
+
+    // 1. 락의 키값 (SpEL 지원 예: "#request.id")
+    String key();
+
+    // 2. 락의 시간 단위 (기본: 초)
+    TimeUnit timeUnit() default TimeUnit.SECONDS;
+
+    // 3. 락을 기다리는 시간 (기본: 5초)
+    // 락 획득을 위해 대기하다가 이 시간이 지나면 예외를 던짐 (Give up)
+    long waitTime() default 5L;
+
+    // 4. 락을 임대하는 시간 (기본: 3초)
+    // 이 시간이 지나면 락이 자동으로 풀림 (서버 다운 시 데드락 방지용)
+    long leaseTime() default 3L;
+}
+```
+
+### 구현 2단계: SpEL 파서(Dynamic Key Parsing)
+- key = "order"라고 하드코딩하는게 아닌
+- key = "#request.memberId"처럼 파라미터 값을 동적으로 꺼내오려면 Spring Expression Language(SpEL)을 파싱해야함
+```java
+package com.zrp.mockpay.dbcore.aop;
+
+import org.springframework.expression.ExpressionParser;
+import org.springframework.expression.spel.standard.SpelExpressionParser;
+import org.springframework.expression.spel.support.StandardEvaluationContext;
+
+/**
+ * SpEL(Spring Expression Language)을 파싱하여 파라미터 값을 추출하는 유틸리티
+ */
+public class CustomSpringELParser {
+
+    private CustomSpringELParser() {
+        // Utility Class는 인스턴스화 방지
+    }
+
+    public static Object getDynamicValue(String[] parameterNames, Object[] args, String key) {
+        ExpressionParser parser = new SpelExpressionParser();
+        StandardEvaluationContext context = new StandardEvaluationContext();
+
+        // 파라미터 이름과 값을 매핑 (예: request -> PaymentRequest 객체)
+        for (int i = 0; i < parameterNames.length; i++) {
+            context.setVariable(parameterNames[i], args[i]);
+        }
+
+        // SpEL 파싱 (예: "#request.memberId" -> 1L)
+        return parser.parseExpression(key).getValue(context, Object.class);
+    }
+}
+```
+
+### 구현 3단계: AOP Aspect 구현(DistributedLockAspect)
+- 가짜 객체(Proxy)가 할 일을 정의함
+```java
+package com.zrp.mockpay.dbcore.aop;
+
+import org.aspectj.lang.ProceedingJoinPoint;
+import org.aspectj.lang.annotation.Around;
+import org.aspectj.lang.annotation.Aspect;
+import org.aspectj.lang.reflect.MethodSignature;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
+
+import java.lang.reflect.Method;
+
+/**
+ * @Aspect: AOP 모듈임을 명시
+ * @Component: 스프링 빈으로 등록
+ */
+@Aspect
+@Component
+public class DistributedLockAop {
+
+    private static final String REDISSON_LOCK_PREFIX = "LOCK:";
+    private static final Logger log = LoggerFactory.getLogger(DistributedLockAop.class);
+
+    private final RedissonClient redissonClient;
+    private final AopForTransaction aopForTransaction;
+
+    public DistributedLockAop(RedissonClient redissonClient, AopForTransaction aopForTransaction) {
+        this.redissonClient = redissonClient;
+        this.aopForTransaction = aopForTransaction;
+    }
+
+    // @Around: 메서드 실행 전후를 모두 제어 (가장 강력한 어드바이스)
+    // 포인트컷: @DistributedLock 어노테이션이 붙은 메서드만 타겟팅
+    @Around("@annotation(com.zrp.mockpay.dbcore.aop.DistributedLock)")
+    public Object lock(ProceedingJoinPoint joinPoint) throws Throwable {
+        
+        // 1. 어노테이션 정보 가져오기 (Reflection)
+        MethodSignature signature = (MethodSignature) joinPoint.getSignature();
+        Method method = signature.getMethod();
+        DistributedLock distributedLock = method.getAnnotation(DistributedLock.class);
+
+        // 2. 키 파싱 (SpEL을 이용해 동적 키 생성)
+        String key = REDISSON_LOCK_PREFIX + CustomSpringELParser.getDynamicValue(
+                signature.getParameterNames(), 
+                joinPoint.getArgs(), 
+                distributedLock.key()
+        );
+
+        // 3. 락 객체 생성
+        RLock rLock = redissonClient.getLock(key);
+
+        try {
+            // 4. 락 획득 시도
+            log.info("Lock 획득 시도: {}", key);
+            boolean available = rLock.tryLock(
+                    distributedLock.waitTime(), 
+                    distributedLock.leaseTime(), 
+                    distributedLock.timeUnit()
+            );
+
+            if (!available) {
+                // 락 획득 실패 시 처리 (재시도 로직을 넣거나 예외 발생)
+                log.warn("Lock 획득 실패: {}", key);
+                return false; 
+            }
+
+            // 5. 락 획득 성공 -> 트랜잭션과 비즈니스 로직 실행
+            // [심화] 여기서 바로 joinPoint.proceed()를 하지 않고 별도 클래스로 분리한 이유?
+            // 부모 트랜잭션 유무와 관계없이 확실하게 커밋된 후 락을 풀기 위함입니다.
+            log.info("Lock 획득 성공: {}", key);
+            return aopForTransaction.proceed(joinPoint);
+
+        } catch (InterruptedException e) {
+            throw new InterruptedException();
+        } finally {
+            try {
+                // 6. 락 해제 (반드시 finally 블록에서)
+                rLock.unlock();
+                log.info("Lock 해제: {}", key);
+            } catch (IllegalMonitorStateException e) {
+                // 이미 락이 풀렸거나, 내 락이 아닌 경우 (크게 신경 안 써도 됨 로그만)
+                log.info("Lock 이미 해제됨 or 만료됨: {}", key);
+            }
+        }
+    }
+}
+```
+
+### [심화] AopForTransaction 클래스가 왜 필요할까?
+- AOP 안에서 joinPoint.proceed()를 바로 호출하면, 락 내부에서 트랜잭션이 시작되고 끝남
+- 문제는 트랜잭션 커밋이 끝나기 전에 락이 풀리는 0.0001초의 틈이 생길 수 있음
+- 스프링 @Transactional AOP 순서 이슈
+- 그 틈에 다른 스레드가 치고 들어오면? 동시성 깨짐
+- 트랜잭션이 확실히 끝난 뒤에 락을 풀도록 트랜잭션 전파 수순(REQUIRES_NEW)를 제어하는 별도 클래스를 두는 패턴을 사용함
+```java
+package com.zrp.mockpay.dbcore.aop;
+
+import org.aspectj.lang.ProceedingJoinPoint;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+
+@Component
+public class AopForTransaction {
+
+    // 부모 트랜잭션이 있어도 무조건 새로운 트랜잭션을 만듦 (락 점유 시간 최소화 목적도 있음)
+    // 사실 Facade에서 락을 걸기 때문에 이 클래스 없이도 동작은 하지만, 
+    // 구조적 안전성을 위해 분리하는 것이 Best Practice입니다.
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public Object proceed(ProceedingJoinPoint joinPoint) throws Throwable {
+        return joinPoint.proceed();
+    }
+}
+```
+
+### 4단계: Facade 리팩토링
+```java
+package com.zrp.mockpay.api.service;
+
+import com.zrp.mockpay.api.dto.PaymentRequest;
+import com.zrp.mockpay.api.dto.PaymentResponse;
+import com.zrp.mockpay.dbcore.aop.DistributedLock; // 우리가 만든 어노테이션
+import org.springframework.stereotype.Component;
+
+import java.util.concurrent.TimeUnit;
+
+@Component
+public class PaymentFacade {
+
+    private final PaymentService paymentService;
+
+    public PaymentFacade(PaymentService paymentService) {
+        this.paymentService = paymentService;
+    }
+
+    // ✨ 깔끔 그 자체!
+    // key: #request.memberId -> 파라미터 'request'의 'memberId' 필드를 키로 쓴다.
+    // waitTime: 100초 (테스트용으로 길게 잡음)
+    @DistributedLock(key = "#request.memberId", waitTime = 100, timeUnit = TimeUnit.SECONDS)
+    public PaymentResponse use(PaymentRequest request) {
+        return paymentService.use(request);
+    }
+}
+```
+
+### Deep Dive
+- AOP Self-Invocation(자기 호출 문제)
+    - 만약 PaymentFacade 내부의 메서드 A가 메서드 B(@Distributed)를 호출하면 락이 안걸림
+    - 프록시는 외부에서 호출할 때만 개입함
+    - 내부에서 this.methodB()를 부르면 프록시를 안 거치고 원복 객체를 바로 부름
+    - 해결: Controller -> Facade -> Service 구조로 외부 호출을 유지
+
+- Redisson의 Watchdog
+    - leaseTime을 -1로 설정하면 30초마다 자동으로 락 시간을 연장
+
+- Redis는 싱글 스레드인데 왜 빠를까?
+    - Redis는 I/O Muiltiplexing 기술을 써서 싱글 스레드임에도 초당 10만건 이상의 요청을 처리함. 원자성(Atomicity)를 보장하기 때문에 락 구현에 최적임
+
+### 지금 구조의 동작 원리
+- 프록시 탄생
+    - 스프링 부트가 시작될 때, @DistributedLock이 붙은 Bean PaymentFacade를 발견
+    - 스프링은 PaymentFacade를 상속받은 가짜 객체를 몰래 만듦
+    - 스프링 컨테이너에 진짜 대신 이 가짜를 등록함
+
+- 런타임 호출 흐름
+    - controller: paymentFacade.use()를 호출함
+    - Proxy(Aspect)
+        - @Around가 가로챔
+        - SpEL Parser로 request.memberId를 Lock:1로 바꿈
+        - Redis: 락 내놔 (tryLock)
+    
+    - Target (Real Object)
+        - 락을 얻은 후 joinPoint.proceed()를 통해 진짜 paymentFacade.use()가 실행됨
+        - 여기서 PaymentService의 트랜잭션이 시작됨
+
+    - Return (돌아옴)
+        - PaymentService 트랜잭션 커밋 완료 (DB 반영 끝)
+
+    - Proxy (Aspect)
+        - Redis: 락 풀어 (unlock)
+    
+    - Controller: 결과를 받음
+
+### 왜 락을 트랜잭션 바깥에서 걸어야하는가?
+- 동시성 이슈를 막기 위해서는 DB 트랜잭션보다 락의 범위가 넓어야함
+- 만약 트랜잭션 내부에서 락을 풀고 커밋하려는 찰나에 다른 스레드가 락을 잡고 들어오면
+- 아직 DB에 반영되지 않은 데이터를 읽어서 데이터 정합성이 깨질 수 있기 때문임
+- Facade 패턴과 AOP를 사용하여 락이 트랜잭션을 완전히 감싸는 구조로 설계를 함
