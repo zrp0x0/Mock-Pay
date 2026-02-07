@@ -43,9 +43,9 @@ public class DistributedLockAop {
 
         // 2. 키 파싱 (SpEL을 이용해 동적 키 생성)
         String key = REDISSON_LOCK_PREFIX + CustomSpringELParser.getDynamicValue(
-                signature.getParameterNames(), 
-                joinPoint.getArgs(), 
-                distributedLock.key()
+                signature.getParameterNames(), // ex. request
+                joinPoint.getArgs(), // PaymentRequest객체
+                distributedLock.key() // "#request.id"
         );
 
         // 3. 락 객체 생성
