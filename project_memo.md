@@ -2065,4 +2065,213 @@ dependencies {
 }
 ```
 
-### 
+### Kafka 주소 알려주기
+- application.yml
+```java
+# ... (위에는 spring.datasource, spring.data.redis 설정이 있을 겁니다) ...
+
+  # 👇 [추가] Kafka 설정 (들여쓰기 주의! spring: 밑에 줄을 맞춰주세요)
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+```
+
+### 구현: 확성기 만들기 (PaymentProducet)
+- 실제로 메시지를 발송하는 클래스를 만들어보자
+```java
+package com.zrp.mockpay.api.kafka;
+
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.stereotype.Component;
+
+@Component
+public class PaymentProducer {
+
+    // KafkaTemplate: 스프링이 제공하는 "Kafka 우체부"
+    private final KafkaTemplate<String, String> kafkaTemplate;
+
+    public PaymentProducer(KafkaTemplate<String, String> kafkaTemplate) {
+        this.kafkaTemplate = kafkaTemplate;
+    }
+
+    // 메시지 발송 메서드
+    public void send(String topic, String message) {
+        System.out.println("📣 [Kafka Producer] 전송 중... Topic: " + topic + ", Msg: " + message);
+        
+        // send(토픽이름, 메시지)
+        kafkaTemplate.send(topic, message);
+        
+        System.out.println("✅ [Kafka Producer] 전송 완료!");
+    }
+}
+```
+
+### 적용: 결제 성공 시 소리치기 (PaymentFacade)
+```java
+    @DistributedLock(key = "#request.memberId", waitTime = 100, timeUnit = TimeUnit.SECONDS)
+    public PaymentResponse use(PaymentRequest request) {
+        
+        // 1. 멱등성 검증: "이미 처리된 주문번호인가?"
+        String idempotencyKey = "pay:history:" + request.orderId();
+        
+        try {
+            // Redis에서 조회
+            String savedResponse = redisTemplate.opsForValue().get(idempotencyKey);
+            
+            if (savedResponse != null) {
+                // ✌️ "어! 이거 아까 처리했어요. 여기 영수증(결과) 가져가세요."
+                System.out.println("♻️ 중복 요청 감지! 저장된 응답 반환: " + request.orderId());
+                return objectMapper.readValue(savedResponse, PaymentResponse.class);
+            }
+
+            // 2. 비즈니스 로직 실행 (실제 결제)
+            PaymentResponse response = paymentService.use(request);
+
+            // 3. 결과 저장 (Redis에 "처리 완료" 도장 찍기)
+            // 24시간 동안 보관 (실무에선 정책에 따라 다름)
+            String responseJson = objectMapper.writeValueAsString(response);
+            redisTemplate.opsForValue().set(idempotencyKey, responseJson, 24, TimeUnit.HOURS);
+
+            paymentProducer.send("payment-topic", responseJson);
+
+            return response;
+
+        } catch (Exception e) {
+            // JSON 변환 에러 등은 런타임 에러로 던짐
+            throw new RuntimeException(e);
+        }
+    }
+```
+
+### 1차 테스트: 허공에 소리치기
+- 지금은 듣는 사람이 없음(Consumer)
+```java
+### 4. Kafka 테스트용 결제 (새로운 주문 번호 필수!)
+# orderId를 "ORDER-KAFKA-01"로 바꿔서 보내보세요.
+POST http://localhost:8080/api/payment/use
+Content-Type: application/json
+
+{
+  "orderId": "ORDER-KAFKA-01",
+  "memberId": 1, 
+  "amount": 100
+}
+```
+- 전송중.. 전송완료 메세지 확인
+
+### 미션: 듣는 귀 만들기(PaymentConsumer)
+- 이제 결제 완료 소리를 듣고 처리해야함
+- PaymentConsumer.java 
+```java
+package com.zrp.mockpay.api.kafka;
+
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.stereotype.Component;
+
+@Component
+public class PaymentConsumer {
+
+    // @KafkaListener: "저는 'payment-topic'이라는 대화방을 항상 듣고 있겠습니다."
+    // groupId: "우리는 'payment-group'이라는 팀입니다." (팀 내에서 한 명만 듣게 할 때 사용)
+    @KafkaListener(topics = "payment-topic", groupId = "payment-group")
+    public void listen(String message) {
+        System.out.println("👂 [Kafka Consumer] 메시지 수신 성공!");
+        System.out.println("📩 내용: " + message);
+
+        // 여기서 "오래 걸리는 작업"을 처리한다고 가정합니다.
+        try {
+            // 1. 포인트 적립 (가정)
+            System.out.println("   ✨ (뒷단 작업) 포인트 적립 중...");
+            Thread.sleep(1000); // 1초 걸리는 척
+
+            // 2. 알림 발송 (가정)
+            System.out.println("   🔔 (뒷단 작업) 고객님께 카톡 발송 완료!");
+            
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+    }
+}
+```
+- @KafkaListner: 스프링이 알아서 스레드를 하나 띄워서, Kafka에 새로운 메세지가 오나 안 오나 계속 감시하게 만듦
+- 핵심: 결제(Use) 메서드는 이미 응답을 주고 끝났는데, 이 녀석은 뒤에서 따로 (비동기로) 돎
+- 즉, 포인트 적립이 10초가 걸려도 고객은 기다리지 않음
+
+### 근데 만약에 비동기로 처리되는 저 작업이 실패한다면?
+- 즉, 결제는 완료되었는데, 적립을 하는 서버가 죽어서 처리를 못하게 되면 안됨
+- 현재는 에러 로그만 찍고 넘어감
+
+### 죽은 메시지를 위한 무덤(DLQ)
+- Dead Letter Queue와 재시도(Retry)를 사용해야함
+- 새로운 전략
+    - 소비자가 처리를 시도함
+    - 실패 시: 잠깐 쉬었다가 3번까지 재시도함
+    - 그래도 실패하면?
+        - 메시지를 버리지 않고, payment-topic.DLT라는 실패한 메시지 보관소롤 옮겨야함
+        - 나중에 개발자가 DLT를 확인해서 DB가 죽었구나하고 수동으로 재처리할 수 있음
+
+### 구현: 안전장치 설정하기
+- KafkaConsumerConfig
+```java
+package com.zrp.mockpay.api.config;
+
+import org.apache.kafka.common.TopicPartition;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.listener.CommonErrorHandler;
+import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
+import org.springframework.kafka.listener.DefaultErrorHandler;
+import org.springframework.util.backoff.FixedBackOff;
+
+@Configuration
+public class KafkaConsumerConfig {
+
+    // 🌟 에러 핸들러 (재시도 + DLQ 이동)
+    @Bean
+    public CommonErrorHandler kafkaErrorHandler(KafkaTemplate<String, String> kafkaTemplate) {
+        
+        // 1. 죽은 편지 발송자 (Dead Letter Publisher)
+        // 실패한 메시지를 "원래토픽이름.DLT" 로 보냅니다.
+        DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(kafkaTemplate,
+                (record, ex) -> new TopicPartition(record.topic() + ".DLT", record.partition()));
+
+        // 2. 재시도 정책 (Backoff)
+        // 1초 간격으로 최대 3번 시도합니다.
+        FixedBackOff backOff = new FixedBackOff(1000L, 3L);
+
+        // 3. 핸들러 조립 (3번 실패하면 -> recoverer가 DLT로 보냄)
+        return new DefaultErrorHandler(recoverer, backOff);
+    }
+    
+    // 🏭 컨테이너 팩토리 (위에서 만든 에러 핸들러를 적용)
+    // 스프링 부트가 @KafkaListener를 찾아서 실행할 때 이 설정을 참고하게 합니다.
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, String> kafkaListenerContainerFactory(
+            org.springframework.kafka.core.ConsumerFactory<String, String> consumerFactory,
+            CommonErrorHandler commonErrorHandler) {
+        
+        ConcurrentKafkaListenerContainerFactory<String, String> factory =
+                new ConcurrentKafkaListenerContainerFactory<>();
+        
+        factory.setConsumerFactory(consumerFactory);
+        factory.setCommonErrorHandler(commonErrorHandler); // 👈 핵심!
+        // 이게 오류나면 어떻게 행동해라 
+        
+        return factory;
+    }
+}
+```
+- 주의사항(어떻게 저 설정이 돌아가는 걸까에 대한 대답)
+    - kafkaListenerContainerFactory() 이 이름으로 반드시 Bean 등록을 해주어야
+    - @KafkaListenr가 이 설정을 따라갈 수 있음
+
+    - // 👇 스프링: "CommonErrorHandler 타입의 빈(Bean)이 있으면 여기에 넣어줘!"
+    -  CommonErrorHandler commonErrorHandler
+
+---
+
+

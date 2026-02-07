@@ -58,6 +58,8 @@ import org.springframework.stereotype.Component;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import com.zrp.mockpay.api.kafka.PaymentProducer;
+
 import java.util.concurrent.TimeUnit;
 
 @Component
@@ -66,11 +68,13 @@ public class PaymentFacade {
     private final PaymentService paymentService;
     private final StringRedisTemplate redisTemplate; // Redis 도구 추가
     private final ObjectMapper objectMapper; // 객체 -> JSON 변환기
+    private final PaymentProducer paymentProducer; // 카프카 확성기
 
-    public PaymentFacade(PaymentService paymentService, StringRedisTemplate redisTemplate, ObjectMapper objectMapper) {
+    public PaymentFacade(PaymentService paymentService, StringRedisTemplate redisTemplate, ObjectMapper objectMapper, PaymentProducer paymentProducer) {
         this.paymentService = paymentService;
         this.redisTemplate = redisTemplate;
         this.objectMapper = objectMapper;
+        this.paymentProducer = paymentProducer;
     }
 
     // ✨ 깔끔 그 자체!
@@ -105,6 +109,8 @@ public class PaymentFacade {
             // 24시간 동안 보관 (실무에선 정책에 따라 다름)
             String responseJson = objectMapper.writeValueAsString(response);
             redisTemplate.opsForValue().set(idempotencyKey, responseJson, 24, TimeUnit.HOURS);
+
+            paymentProducer.send("payment-topic", responseJson);
 
             return response;
 
