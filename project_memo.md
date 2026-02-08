@@ -2274,4 +2274,135 @@ public class KafkaConsumerConfig {
 
 ---
 
+## Day 010. 장애 격리와 회복 탄력성
 
+### 상황 설명
+- 결제 요청 -> 은행 서버 호출 -> 은행 서버 다운됨 -> 우리 서버는 기다리다가 밀린 요청으로 서버 다운
+- 목표
+    - 서버가 이상하다? -> 즉시 차단 -> 지금 은행 점검 중입니다라고 바로 거절 -> 서버 생존
+
+- 도구: Resilience4j
+    - 넷플릭스의 Hystrix가 은퇴하고 요즘은 이게 대세
+
+### 서킷 브레이커 설치
+```kotlin
+dependencies {
+    // ... 기존 의존성 ...
+
+    // 👇 [추가] 서킷 브레이커 & AOP 필수
+    implementation("org.springframework.cloud:spring-cloud-starter-circuitbreaker-resilience4j")
+    implementation("org.springframework.boot:spring-boot-starter-aop")
+}
+```
+    - 주의: spring-cloud 버전을 맞추려면 BOM(Biil of Materials) 설정이 필요한데, 복잡할 수 있으니 일단 가장 간단한 방법(starter 없이 라이브러리 직접 추가)로 가봄
+
+```kotlin
+dependencies {
+    // ...
+    // 👇 이걸로 넣어주세요! (Resilience4j Spring Boot 3 Starter)
+    implementation("io.github.resilience4j:resilience4j-spring-boot3:2.2.0")
+    implementation("org.springframework.boot:spring-boot-starter-aop")
+}
+```
+
+### application.yml 수정
+```yml
+# ... (위에는 kafka 설정 등) ...
+
+# 👇 [추가] Resilience4j 설정
+resilience4j:
+  circuitbreaker:
+    instances:
+      bankService: # 서킷 브레이커 이름
+        slidingWindowType: COUNT_BASED
+        slidingWindowSize: 5      # 최근 5개 요청을 기록
+        failureRateThreshold: 40  # 그중 40%(2개) 이상 실패하면 차단
+        waitDurationInOpenState: 10s # 10초 동안 문 잠그고 대기 (Open)
+        permittedNumberOfCallsInHalfOpenState: 3 # 10초 뒤에 3명만 들여보내서 간보기 (Half-Open)
+```
+- spring하고 같은 영역에 (스프링 안에 하면 안됨)
+- 설명
+    - 5개의 요청을 기록하고 그 요청의 2개 이상 실패하면 차단
+    - 10초 동안 문잠그고 대기 하다가 
+    - 10초 뒤에 다시 문을 열어줘봄
+    - 이후 3개의 요청 확인
+
+### 외부 은행 호출 흉내내기
+```java
+package com.zrp.mockpay.api.service;
+
+import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker; // 👈 import
+// ... 기존 imports ...
+
+@Service
+public class PaymentService {
+    // ... 기존 필드 및 생성자 ...
+
+    // 👇 [추가] 외부 은행 결제 시뮬레이션
+    // "bankService"라는 설정(위에서 만든 yml)을 따르겠다.
+    // 실패하면 fallback(대안) 메서드를 실행해라.
+    @CircuitBreaker(name = "bankService", fallbackMethod = "payFallback")
+    public String callForeignBank() {
+        // 상황: 외부 은행이 계속 에러를 냄
+        System.out.println("🏦 [Bank] 외부 은행 서버 호출 중...");
+        throw new RuntimeException("은행 서버 다운됨!");
+    }
+
+    // 👇 [대안] 서킷이 열리거나 에러가 났을 때 실행될 메서드
+    // 파라미터와 리턴 타입이 원본 메서드와 같아야 함 (+ 예외 파라미터)
+    public String payFallback(Throwable t) {
+        // 1. 서킷 브레이커가 차단한 경우 (OPEN 상태)
+        if (t instanceof CallNotPermittedException) {
+            System.out.println("⛔ [Circuit Breaker] 회로가 열려있습니다! (메서드 실행 아예 안 함)");
+        } 
+        // 2. 메서드 실행은 했는데 에러가 난 경우 (CLOSED 상태)
+        else {
+            System.out.println("🛡️ [Fallback] 에러 발생으로 인한 대체 로직: " + t.getMessage());
+        }
+        return "죄송합니다. 현재 은행 점검 중으로 나중에 시도해주세요.";
+    }
+
+    // ... 기존 charge, use 메서드 ...
+}
+```
+
+### 테스트용 API 만들기 (PaymentController)
+```java
+// ...
+@GetMapping("/bank-test")
+public String testBank() {
+    return paymentService.callForeignBank();
+}
+```
+
+### 시나리오로 이해를 해보자
+- 3명 중 1명이 성공하는 시나리오?
+    - 1: 외부 서버 A가 켜지는 중
+    - 2: 외부 서버 A가 켜지는 중
+    - 3: 서버 A랑 통신 성공
+    - 그래도 무조건이라고 할 수 없으니깐, 일단 
+    
+    - 1: 운 좋게 서버 A에 배정됨
+    - 2: 운 나쁘게 고장난 서버 B에 배정됨
+    - 3: 운 좋게 서버 C에 배정됨
+    - 그래도 2명이나 성공했으니깐 연결은 시도해줌
+    
+- 즉, 외부 서버와의 응답 성공률을 보고 
+    - 우리가 설정한 갯수를 다 보고 나서 판단함
+
+### 예외 상황을 설정하기
+```yml
+# 👇 [실무 꿀팁] "이런 에러가 나면 실패로 카운트해라"
+recordExceptions:
+    - java.io.IOException            # 네트워크 연결 실패
+    - java.util.concurrent.TimeoutException # 시간 초과
+    - org.springframework.web.client.HttpServerErrorException # 500번대 에러
+
+# 👇 [실무 꿀팁] "이런 에러는 그냥 넘어가라 (문 잠그지 마라)"
+ignoreExceptions:
+    - org.springframework.web.client.HttpClientErrorException # 400번대 (사용자 실수)
+```
+    - 그냥 에러났다고 닫아버리면 안됨
+    - 그리고 외부 서버 연결은 RestTemplate을 사용해서 에러를 받을 수 있음
+
+--- 

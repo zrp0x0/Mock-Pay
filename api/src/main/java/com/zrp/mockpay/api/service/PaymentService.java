@@ -13,6 +13,9 @@ import com.zrp.mockpay.api.dto.ChargeRequest;
 
 import org.springframework.stereotype.Service;
 
+import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker; // 👈 import
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException; // 👈 import 추가
+
 @Service // "나는 비즈니스 로직을 담당하는 직원(Service)이야"
 public class PaymentService {
 
@@ -24,6 +27,30 @@ public class PaymentService {
         this.memberRepository = memberRepository;
         this.paymentHistoryRepository = paymentHistoryRepository;
         this.pointService = pointService;
+    }
+
+    // 👇 [추가] 외부 은행 결제 시뮬레이션
+    // "bankService"라는 설정(위에서 만든 yml)을 따르겠다.
+    // 실패하면 fallback(대안) 메서드를 실행해라.
+    @CircuitBreaker(name = "bankService", fallbackMethod = "payFallback")
+    public String callForeignBank() {
+        // 상황: 외부 은행이 계속 에러를 냄
+        System.out.println("🏦 [Bank] 외부 은행 서버 호출 중...");
+        throw new RuntimeException("은행 서버 다운됨!");
+    }
+
+    // 👇 [대안] 서킷이 열리거나 에러가 났을 때 실행될 메서드
+    // 파라미터와 리턴 타입이 원본 메서드와 같아야 함 (+ 예외 파라미터)
+    public String payFallback(Throwable t) {
+        // 1. 서킷 브레이커가 차단한 경우 (OPEN 상태)
+        if (t instanceof CallNotPermittedException) {
+            System.out.println("⛔ [Circuit Breaker] 회로가 열려있습니다! (메서드 실행 아예 안 함)");
+        } 
+        // 2. 메서드 실행은 했는데 에러가 난 경우 (CLOSED 상태)
+        else {
+            System.out.println("🛡️ [Fallback] 에러 발생으로 인한 대체 로직: " + t.getMessage());
+        }
+        return "죄송합니다. 현재 은행 점검 중으로 나중에 시도해주세요.";
     }
 
     // 👇 [중요] Transactional: 이 메서드가 끝날 때까지 에러가 없어야 DB에 반영됨!
@@ -83,4 +110,6 @@ public class PaymentService {
         // 4. 결과 리턴
         return new PaymentResponse("결제 성공", member.getBalance());
     }
+
+
 }

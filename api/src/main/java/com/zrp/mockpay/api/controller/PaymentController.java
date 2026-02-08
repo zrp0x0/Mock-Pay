@@ -5,6 +5,7 @@ import com.zrp.mockpay.api.dto.PaymentRequest;
 import com.zrp.mockpay.api.dto.PaymentResponse;
 import com.zrp.mockpay.api.service.PaymentFacade;
 import com.zrp.mockpay.api.service.PaymentService;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -33,5 +34,11 @@ public class PaymentController {
     public PaymentResponse use(@RequestBody PaymentRequest request) {
         // return paymentService.use(request);
         return paymentFacade.use(request);
+    }
+
+    // ...
+    @GetMapping("/bank-test")
+    public String testBank() {
+        return paymentService.callForeignBank();
     }
 }
