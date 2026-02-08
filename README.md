@@ -4,7 +4,7 @@
 
 ---
 
-# 💳 Mock-Pay: 분산 환경을 고려한 결제 시스템 기술 다이브
+# Mock-Pay: 결제 시스템 기술 다이브
 
 > **“1번 요청하나, 100번 요청하나 결과는 같아야 한다.”**
 > 대규모 트래픽 환경에서의 **데이터 정합성 보장**과 **시스템 안정성 확보**를 목표로 한 결제 시스템 기술 실험 프로젝트
@@ -31,7 +31,7 @@
 
 ## 2. 기술적 의사결정 (Technical Decisions)
 
-### 🏗 멀티 모듈 아키텍처 (Multi-Module)
+### 멀티 모듈 아키텍처 (Multi-Module)
 
 **결정**
 
@@ -46,7 +46,7 @@
 
 ---
 
-### 🔒 Redisson 기반 분산 락 (Distributed Lock)
+### Redisson 기반 분산 락 (Distributed Lock)
 
 **결정**
 
@@ -60,7 +60,7 @@
 
 ---
 
-### ⚡ Kafka 비동기 이벤트 처리
+### Kafka 비동기 이벤트 처리
 
 **결정**
 
@@ -76,7 +76,7 @@
 
 ## 3. 핵심 트러블 슈팅 (Key Trouble Shooting)
 
-### 🚨 Issue 1. 레이스 컨디션 & 비관적 락의 성능 한계
+### Issue 1. 레이스 컨디션 & 비관적 락의 성능 한계
 
 #### Situation
 
@@ -111,7 +111,7 @@
 
 ---
 
-### 🚨 Issue 2. Checked Exception 발생 시 롤백 미동작
+### Issue 2. Checked Exception 발생 시 롤백 미동작
 
 #### Situation
 
@@ -138,7 +138,7 @@
 
 ---
 
-### 🚨 Issue 3. 중복 결제 요청 (Idempotency)
+### Issue 3. 중복 결제 요청 (Idempotency)
 
 #### Situation
 
@@ -159,7 +159,7 @@
 
 ## 4. 장애 탄력성 (Resilience & Stability)
 
-### 🔁 Circuit Breaker (Resilience4j)
+### Circuit Breaker (Resilience4j)
 
 * 외부 은행 서버 장애 시 회로 차단(Open)
 * 연쇄 장애(Cascading Failure) 방지
@@ -170,7 +170,7 @@
 
 ---
 
-### 📦 Kafka Dead Letter Queue (DLQ)
+### Kafka Dead Letter Queue (DLQ)
 
 * 비동기 이벤트 처리 중 최종 실패 메시지를 `.DLT` 토픽으로 전송
 * 데이터 유실 방지
